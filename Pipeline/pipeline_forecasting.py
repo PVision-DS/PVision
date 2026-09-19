@@ -35,7 +35,7 @@ def get_weather_at(city_name, current_datetime):
         'longitude': lon,
         'hourly': 'temperature_2m,relative_humidity_2m,pressure_msl,cloud_cover,wind_speed_10m,precipitation,snowfall,shortwave_radiation,is_day',
         'wind_speed_unit': 'ms',
-        'timezone': 'UTC',
+        'timezone': 'auto',
         'forecast_days': 7
     }
     response = requests.get(url, params=params)
