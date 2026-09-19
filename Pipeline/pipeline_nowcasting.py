@@ -19,7 +19,8 @@ def get_current_weather(lat, lon):
     url = (f"https://api.open-meteo.com/v1/forecast?"
            f"latitude={lat}&longitude={lon}"
            f"&current=temperature_2m,relative_humidity_2m,cloud_cover,"
-           f"wind_speed_10m,shortwave_radiation,surface_pressure,rain,snowfall")
+           f"wind_speed_10m,shortwave_radiation,surface_pressure,rain,snowfall,is_day"
+           f"&timezone=auto")
     return requests.get(url).json()['current']
 
 def calculate_day_length(lat, date):
@@ -35,12 +36,18 @@ def calculate_day_length(lat, date):
 def predict_nowcast(city_name):
     lat, lon = CITIES[city_name]
     weather = get_current_weather(lat, lon)
-    now = datetime.now()
+    now = datetime.fromisoformat(weather['time'])   
+
+    ghi_adjusted = weather['shortwave_radiation'] / 4
+
+    if weather.get('is_day', 1) == 0 or ghi_adjusted <= 0.1:
+        print("It's nighttime — no solar output expected")
+        return 0.0
 
     day_length = calculate_day_length(lat, now)
 
     features = [[
-        weather['shortwave_radiation'],
+        ghi_adjusted,
         weather['temperature_2m'],
         weather['surface_pressure'],
         weather['relative_humidity_2m'],
