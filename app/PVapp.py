@@ -9,6 +9,7 @@ import streamlit as st
 from datetime import datetime, timedelta
 from PIL import Image
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -385,7 +386,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-model = joblib.load("../Pipeline/nowcast_model.pkl")
+BASE_DIR = Path(__file__).resolve().parent
+
+model = joblib.load(
+    BASE_DIR.parent / "Pipeline" / "nowcast_model.pkl"
+)
 expected_cols = list(model.feature_names_in_)
 
 
