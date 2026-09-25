@@ -15,13 +15,18 @@ CITIES = {
     'Hamburg': (53.5511, 9.9937),
 }
 
+# Fetch the current weather for a city, in the units the training data uses
 def get_current_weather(lat, lon):
-    url = (f"https://api.open-meteo.com/v1/forecast?"
-           f"latitude={lat}&longitude={lon}"
-           f"&current=temperature_2m,relative_humidity_2m,cloud_cover,"
-           f"wind_speed_10m,shortwave_radiation,surface_pressure,rain,snowfall,is_day"
-           f"&timezone=auto")
-    return requests.get(url).json()['current']
+    url = 'https://api.open-meteo.com/v1/forecast'
+    params = {
+        'latitude': lat,
+        'longitude': lon,
+        'current': 'temperature_2m,relative_humidity_2m,cloud_cover,'
+                   'wind_speed_10m,shortwave_radiation,pressure_msl,rain,snowfall,is_day',
+        'wind_speed_unit': 'ms',
+        'timezone': 'UTC'
+    }
+    return requests.get(url, params=params).json()['current']
 
 def calculate_day_length(lat, date):
     day_of_year = date.timetuple().tm_yday
@@ -31,14 +36,20 @@ def calculate_day_length(lat, date):
     cos_hour_angle = np.clip(cos_hour_angle, -1, 1)
     hour_angle = np.arccos(cos_hour_angle)
     day_length_hours = (2 * hour_angle * 24) / (2 * np.pi)
-    return day_length_hours * 60   
+    return day_length_hours * 60
 
+# Estimate the power being produced right now
 def predict_nowcast(city_name):
+    city_name = city_name.strip().title()
+    if city_name not in CITIES:
+        print('Error: city not supported:', city_name)
+        return None
+
     lat, lon = CITIES[city_name]
     weather = get_current_weather(lat, lon)
-    now = datetime.fromisoformat(weather['time'])   
+    now = datetime.fromisoformat(weather['time'])
 
-    ghi_adjusted = weather['shortwave_radiation'] / 4
+    ghi_adjusted = weather['shortwave_radiation'] / 4   # API returns W/m2, training data is Wh/m2 per 15-min step
 
     if weather.get('is_day', 1) == 0 or ghi_adjusted <= 0.1:
         print("It's nighttime — no solar output expected")
@@ -49,15 +60,15 @@ def predict_nowcast(city_name):
     features = [[
         ghi_adjusted,
         weather['temperature_2m'],
-        weather['surface_pressure'],
+        weather['pressure_msl'],
         weather['relative_humidity_2m'],
         weather['wind_speed_10m'],
         weather.get('rain', 0),
-        weather.get('snowfall', 0),
+        weather.get('snowfall', 0) * 10,   # API returns cm, training data is mm
         weather['cloud_cover'],
         day_length,
-        np.sin(2*np.pi*now.hour/24), np.cos(2*np.pi*now.hour/24),
-        np.sin(2*np.pi*now.month/12), np.cos(2*np.pi*now.month/12)
+        np.sin(2 * np.pi * now.hour / 24), np.cos(2 * np.pi * now.hour / 24),
+        np.sin(2 * np.pi * now.month / 12), np.cos(2 * np.pi * now.month / 12)
     ]]
 
     model = joblib.load(MODEL_PATH)

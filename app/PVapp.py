@@ -10,10 +10,35 @@ from datetime import datetime, timedelta
 from PIL import Image
 from dotenv import load_dotenv
 from pathlib import Path
+import sys
+from datetime import timezone
+from zoneinfo import ZoneInfo
+
+# Use the project's own prediction pipelines instead of duplicating their logic here
+sys.path.append(str(Path(__file__).resolve().parent.parent / "Pipeline"))
+from pipeline_nowcasting import predict_nowcast
+from pipeline_forecasting import get_forecast, get_weather_at, allowed_cities, horizon_minutes
+from LLM_explainer import get_llm_explanation
+
+# What the user sees in the Time box, mapped to the horizon key the models use
+TIME_OPTIONS = {
+    "Right now": "Now",
+    "In 15 minutes": "15min",
+    "In 30 minutes": "30min",
+    "In 45 minutes": "45min",
+    "In 1 hour": "1hour",
+    "In 1 hour 15 minutes": "75min",
+    "In 1 hour 30 minutes": "90min",
+    "In 1 hour 45 minutes": "105min",
+    "In 2 hours": "2hour",
+}
+
+# The models work in UTC; these are used only to show the user local time in the chosen city
+CITY_TZ = {'Warsaw': 'Europe/Warsaw', 'Berlin': 'Europe/Berlin',
+           'Amsterdam': 'Europe/Amsterdam', 'London': 'Europe/London',
+           'Hamburg': 'Europe/Berlin'}
 
 load_dotenv()
-HF_TOKEN = os.environ.get("HF_TOKEN")
-HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
 
 
 # Logo embedded as base64
@@ -388,11 +413,6 @@ st.markdown("""
 
 BASE_DIR = Path(__file__).resolve().parent
 
-model = joblib.load(
-    BASE_DIR.parent / "Pipeline" / "nowcast_model.pkl"
-)
-expected_cols = list(model.feature_names_in_)
-
 
 with st.sidebar:
     st.markdown(f"<div class='sidebar-logo-wrap'>{logo_html(56, reversed_logo=True)}</div>", unsafe_allow_html=True)
@@ -421,7 +441,7 @@ with st.sidebar:
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown(
-        f"<a class='sidebar-link-pill' href='https://github.com/MaryamMohammed2002/PVision' target='_blank'>"
+        f"<a class='sidebar-link-pill' href='https://github.com/PVision-DS/PVision' target='_blank'>"
         f"{icon('github', 15)} GitHub Repository</a>",
         unsafe_allow_html=True,
     )
@@ -439,39 +459,6 @@ def get_weather_icon(clouds, rain, snow, is_daylight):
     return icon("sun", 26, "#e8a33d")
 
 
-def build_row(hourly, idx, daily_dates, daily, time_obj):
-   
-    ghi = hourly["shortwave_radiation"][idx] / 4
-    temp = hourly["temperature_2m"][idx]
-    humidity = hourly["relative_humidity_2m"][idx]
-    pressure = hourly["pressure_msl"][idx]
-    wind_speed = hourly["wind_speed_10m"][idx]
-    rain_1h = hourly["precipitation"][idx]
-    snow_1h = hourly["snowfall"][idx] * 10
-    clouds_all = hourly["cloud_cover"][idx]
-
-    date_str = time_obj.strftime("%Y-%m-%d")
-    day_idx = daily_dates.index(date_str) if date_str in daily_dates else 0
-    sunrise = datetime.fromisoformat(daily["sunrise"][day_idx])
-    sunset = datetime.fromisoformat(daily["sunset"][day_idx])
-    day_length = (sunset - sunrise).total_seconds() / 60
-    sunlight_time = max((time_obj - sunrise).total_seconds() / 60, 0)
-    sun_fraction = min(sunlight_time / day_length, 1.0) if day_length > 0 else 0
-    is_daylight = sunrise <= time_obj <= sunset
-
-    hour, month = time_obj.hour, time_obj.month
-    row = {
-        "GHI": ghi, "temp": temp, "pressure": pressure, "humidity": humidity,
-        "wind_speed": wind_speed, "rain_1h": rain_1h, "snow_1h": snow_1h,
-        "clouds_all": clouds_all, "weather_type": 1,
-        "sunlightTime": sunlight_time, "dayLength": day_length,
-        "SunlightTime/daylength": sun_fraction,
-        "hour_sin": np.sin(2 * np.pi * hour / 24), "hour_cos": np.cos(2 * np.pi * hour / 24),
-        "month_sin": np.sin(2 * np.pi * month / 12), "month_cos": np.cos(2 * np.pi * month / 12),
-    }
-    return row, clouds_all, rain_1h, snow_1h, is_daylight, temp, humidity, wind_speed
-
-
 def metric_card(icon_name, label, value):
     return (
         f"<div class='custom-metric'>"
@@ -480,97 +467,6 @@ def metric_card(icon_name, label, value):
         f"<div class='custom-metric-label'>{label}</div>"
         f"</div>"
     )
-
-
-def get_rule_based_explanation(is_daylight, ghi_val, clouds_all, prediction):
-    """Fallback explanation used if the LLM call fails or no HF_TOKEN is set."""
-    if not is_daylight:
-        return (
-            "It's nighttime at this hour, so no sunlight is reaching the panels — "
-            "that's why the predicted output is at or near zero."
-        )
-    elif prediction < 0.5:
-        return (
-            f"Irradiance is only {ghi_val:.0f} W/m² and cloud cover is {clouds_all:.0f}%, "
-            "so very little sunlight is reaching the panels — expect minimal output."
-        )
-    elif prediction < 5:
-        return (
-            f"With {ghi_val:.0f} W/m² of irradiance and {clouds_all:.0f}% cloud cover, "
-            "conditions support a moderate output — sunlight is present but partly blocked or weak."
-        )
-    else:
-        return (
-            f"Strong irradiance ({ghi_val:.0f} W/m²) and low cloud cover ({clouds_all:.0f}%) "
-            "make this a high-output window — close to ideal conditions for solar generation."
-        )
-
-
-def get_llm_explanation(city_name, prediction, row, day_length_minutes, target_time, is_daylight):
-    """Ask an LLM (Llama 3.1 8B via Hugging Face) to explain the prediction in
-    plain language. Falls back to a rule-based explanation if no HF_TOKEN is
-    configured, or if the API call fails for any reason. Also returns a short
-    debug string explaining *why* it fell back, useful while troubleshooting."""
-    fallback = get_rule_based_explanation(is_daylight, row["GHI"], row["clouds_all"], prediction)
-
-    if not HF_TOKEN:
-        return fallback, False, "No HF_TOKEN found in .env"
-
-    month_names = ["January", "February", "March", "April", "May", "June",
-                   "July", "August", "September", "October", "November", "December"]
-    situation = "It is daytime" if is_daylight else "It is nighttime, no solar irradiance"
-
-    prompt = f"""You are a professional solar energy analyst explaining a solar PV power prediction to a general audience.
-
-Your task is to explain whether the predicted solar power output is reasonable based on the weather and time-related features used by the prediction model.
-
-Prediction context:
-- City: {city_name}
-- Predicted power output: {prediction:.2f} kW
-
-Weather and environmental inputs:
-- Adjusted GHI: {row['GHI']:.2f} W/m²
-- Temperature: {row['temp']} °C
-- Surface pressure: {row['pressure']} hPa
-- Relative humidity: {row['humidity']} %
-- Wind speed: {row['wind_speed']} m/s
-- Rain: {row['rain_1h']} mm
-- Snowfall: {row['snow_1h']} mm
-- Cloud cover: {row['clouds_all']} %
-- Estimated daylight duration: {day_length_minutes / 60:.2f} hours
-
-Time-related inputs (local time at the specified city):
-- Time of day: {target_time.strftime('%I:%M %p')}
-- Month: {month_names[target_time.month - 1]}
-- Daytime condition: {situation}
-
-Analysis requirements:
-1. Assess whether the predicted power output is reasonable given the provided conditions.
-2. Identify the most important factors affecting the prediction, especially solar radiation, cloud cover, daylight, and time of day.
-3. Mention other weather factors only when they meaningfully contribute to the explanation.
-4. If the conditions indicate nighttime or very low solar radiation, clearly explain why the expected solar power should be very low or zero.
-5. Do not invent weather conditions, values, or relationships that are not supported by the provided data.
-6. Keep the explanation concise, clear, and understandable to a non-technical user.
-7. Give a 2-3 sentence explanation only.
-"""
-
-    headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "model": "meta-llama/Llama-3.1-8B-Instruct",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 400,
-        "temperature": 0.7,
-    }
-
-    try:
-        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=20)
-        if response.status_code == 200:
-            content = response.json()["choices"][0]["message"]["content"]
-            return content.strip(), True, None
-        return fallback, False, f"HTTP {response.status_code}: {response.text[:200]}"
-    except requests.exceptions.RequestException as e:
-        return fallback, False, f"Request failed: {e}"
-
 
 
 st.markdown(
@@ -585,79 +481,87 @@ st.markdown(
 st.markdown("---")
 
 
-with st.form("prediction_form"):
+with st.container(border=True):
     st.markdown(f"<div class='section-heading'>{icon('pin', 18)} Where and when?</div>", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
-        city_name = st.text_input("City", placeholder="Enter city name")
+        city_name = st.selectbox("City", list(allowed_cities))
     with col2:
-        hours_ahead = st.number_input("Hours ahead (0 = now)", min_value=0, max_value=3, value=0)
-    submitted = st.form_submit_button(f"Predict Power Output")
+        horizon_choice = TIME_OPTIONS[st.selectbox("Time", list(TIME_OPTIONS))]
+
+    submitted = st.button("Predict Power Output")
 
 
 if submitted:
-    geo_url = "https://geocoding-api.open-meteo.com/v1/search"
-    
-    geo_response = requests.get(
-        geo_url, params={"name": city_name, "count": 10, "language": "en"}
-    ).json()
+    # The models were trained on UTC timestamps, so every prediction is made in UTC
+    tz = ZoneInfo(CITY_TZ[city_name])
+    # The weather API serves 15-minute data, matching the resolution the models were trained on,
+    # so the starting point is the most recent quarter hour
+    _now = datetime.now(timezone.utc)
+    now_utc = _now.replace(minute=(_now.minute // 15) * 15, second=0, microsecond=0, tzinfo=None)
 
-    if "results" not in geo_response or not geo_response["results"]:
-        st.error(f"Could not find a location named '{city_name}'. Try a different spelling.")
+    # Right now uses the nowcasting model, the next two hours use the horizon models,
+    # and a chosen date/hour uses the nowcasting model on the forecast weather for that hour
+    if horizon_choice == "Now":
+        prediction = predict_nowcast(city_name)
+        weather_utc = now_utc
+        target_time = now_utc.replace(tzinfo=timezone.utc).astimezone(tz)
+        model_label = "current output"
+        conditions_label = f"Conditions at {target_time.strftime('%Y-%m-%d %H:%M')} local time"
+
+    else:
+        minutes_ahead = horizon_minutes[horizon_choice]
+        prediction = get_forecast(city_name, horizon_choice, now_utc)
+        weather_utc = now_utc
+        target_time = (now_utc.replace(tzinfo=timezone.utc)
+                       + timedelta(minutes=minutes_ahead)).astimezone(tz)
+        if minutes_ahead % 60 == 0:
+            model_label = f"{minutes_ahead // 60}-hour forecast"
+        else:
+            model_label = f"{minutes_ahead}-minute forecast"
+        # The forecast models read the current hour's weather, so say so rather than
+        # labelling these readings with the target time
+        weather_local = now_utc.replace(tzinfo=timezone.utc).astimezone(tz)
+        conditions_label = (f"Conditions at {weather_local.strftime('%H:%M')}, "
+                            f"used to forecast {target_time.strftime('%H:%M')} local time")
+
+    if prediction is None:
+        st.error("Could not produce a prediction for this city and time. "
+                 "The weather API only covers the next seven days.")
+        st.stop()
+    prediction = max(float(prediction), 0.0)
+
+    # Weather for the display cards, already converted to the units the models were trained on
+    weather = get_weather_at(city_name, weather_utc)
+    if weather is None:
+        st.error("Could not fetch weather for this city.")
         st.stop()
 
-    candidates = geo_response["results"]
-   
-    exact_matches = [c for c in candidates if c["name"].strip().lower() == city_name.strip().lower()]
-    pool = exact_matches if exact_matches else candidates
-    location = max(pool, key=lambda c: c.get("population") or 0)
-    lat, lon = location["latitude"], location["longitude"]
+    temp = weather["temp"]
+    humidity = weather["humidity"]
+    clouds_all = weather["clouds_all"]
+    wind_speed = weather["wind_speed"]
+    rain_1h = weather["rain_1h"]
+    snow_1h = weather["snow_1h"]
+    is_daylight = weather["is_day"] == 1
 
-    weather_url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat, "longitude": lon,
-        "hourly": "temperature_2m,relative_humidity_2m,precipitation,snowfall,"
-                  "cloud_cover,pressure_msl,wind_speed_10m,shortwave_radiation",
-        "daily": "sunrise,sunset", "timezone": "auto", "forecast_days": 3,
+    row = {
+        "GHI": weather["GHI"], "temp": temp, "pressure": weather["pressure"],
+        "humidity": humidity, "wind_speed": wind_speed, "rain_1h": rain_1h,
+        "snow_1h": snow_1h, "clouds_all": clouds_all,
     }
-    weather_response = requests.get(weather_url, params=params).json()
-    hourly = weather_response["hourly"]
-    hourly_times = hourly["time"]
-    daily = weather_response["daily"]
-    daily_dates = [d.split("T")[0] for d in daily["sunrise"]]
-
-    
-    utc_offset_seconds = weather_response.get("utc_offset_seconds", 0)
-    now_at_city = datetime.utcnow() + timedelta(seconds=utc_offset_seconds)
-    now_rounded = now_at_city.replace(minute=0, second=0, microsecond=0)
-    now_str = now_rounded.strftime("%Y-%m-%dT%H:00")
-    if now_str not in hourly_times:
-        st.error("Current time is outside the forecast range available from the weather API.")
-        st.stop()
-    idx_now = hourly_times.index(now_str)
 
     st.markdown(
         f"<div style='display:flex; align-items:center; gap:6px; color:#3d3d3d;'>"
-        f"{icon('pin', 16)} <b>{location['name']}, {location.get('country', '')}</b></div>",
+        f"{icon('pin', 16)} <b>{city_name}</b> &middot; {model_label}</div>",
         unsafe_allow_html=True,
     )
 
-    idx_target = idx_now + int(hours_ahead)
-    if idx_target >= len(hourly_times):
-        st.error("Requested time is outside the forecast range available from the weather API.")
-        st.stop()
-
-    target_time = datetime.fromisoformat(hourly_times[idx_target])
-    row, clouds_all, rain_1h, snow_1h, is_daylight, temp, humidity, wind_speed = build_row(
-        hourly, idx_target, daily_dates, daily, target_time
-    )
-    X = pd.DataFrame([row], columns=expected_cols)
-    prediction = max(float(model.predict(X)[0]), 0.0)
     weather_icon = get_weather_icon(clouds_all, rain_1h, snow_1h, is_daylight)
 
     st.markdown(
         f"<div class='section-heading' style='margin-top:14px;'>{weather_icon} "
-        f"Conditions at {target_time.strftime('%Y-%m-%d %H:%M')}</div>",
+        f"{conditions_label}</div>",
         unsafe_allow_html=True,
     )
     c1, c2, c3, c4 = st.columns(4)
@@ -679,7 +583,7 @@ if submitted:
 
     with st.spinner("Generating explanation..."):
         explanation, is_llm, debug_info = get_llm_explanation(
-            location["name"], prediction, row, row["dayLength"], target_time, is_daylight
+            city_name, prediction, row, target_time, is_daylight
         )
 
     st.markdown(
@@ -688,8 +592,6 @@ if submitted:
         unsafe_allow_html=True,
     )
     st.caption("Explanation generated by AI (Llama 3.1)" if is_llm else "Rule-based explanation")
-    if not is_llm and debug_info:
-        st.caption(f"🔧 Debug: {debug_info}")  # remove this line once LLM is confirmed working
 
     st.markdown("<style>.gauge-wrap{text-align:center;} .gauge-outer{width:190px;height:190px;border-radius:50%;margin:10px auto 4px auto;display:flex;align-items:center;justify-content:center;} .gauge-inner{width:148px;height:148px;border-radius:50%;background:#f7f3ea;display:flex;flex-direction:column;align-items:center;justify-content:center;} .gauge-value{font-size:1.9em;font-weight:800;color:#516344;} .gauge-sublabel{font-size:0.75em;color:#8a8a8a;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px;} .gauge-scale{display:flex;justify-content:space-between;width:190px;margin:2px auto 0 auto;font-size:0.75em;color:#a0a0a0;}</style>", unsafe_allow_html=True)
 
